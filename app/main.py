@@ -517,9 +517,8 @@ class RehearsalPedalAuditRequest(RehearsalParams):
                 )
         prev: Optional[float] = None
         for i, event in enumerate(self.pedal_events):
-            if prev is not None and event.seconds < prev - 1e-9 * max(
-                1.0, abs(prev)
-            ):
+            # 非降序预检（严格小于即违规）；权威判定由校对核心按十进制精确比较
+            if prev is not None and event.seconds < prev:
                 raise ValueError(
                     f"第 {i + 1} 个踏板事件秒数 {event.seconds:g} 早于上一条"
                     f" {prev:g}：踏板事件必须按时间非降序排列"
@@ -1262,13 +1261,15 @@ def audit_rehearsal_pedal_log(
 ) -> RehearsalPedalAuditResponse:
     """为已保存方案校对排练踏板日志。
 
-    复用定位/提示接口的演奏顺序与时间轴，先用排练参数（每小节拍数、速度、
-    互不相交的重复段）生成含重复段回跳回翻的应翻页提示；再把按时间非降序
-    提交的踏板事件（秒数、操作后页码）与提示做全局一对一匹配——仅当目标页
-    相同且时间差不超过非负容差时允许匹配。依次最小化漏翻与多翻总数、匹配
-    时间差之和，仍并列取匹配的踏板事件序号序列字典序最小。返回每条提示的
-    匹配或漏翻、未匹配事件的多翻标记及两项代价。秒数越出演奏时长（含恰等
-    于总时长）或页码越出 1..规划页数的事件返回 422。
+    校对内部把每小节拍数、速度（BPM）按输入数值的十进制字面量构造有理数，
+    按重复段展开精确重建含回跳回翻的应翻页提示时刻（不经浮点累加）；踏板
+    事件秒数与非负容差同样按十进制字面量转换，匹配资格（目标页相同且时间差
+    不超过容差）与累计时间差均为精确有理数比较，不使用浮点或 epsilon。依次
+    最小化漏翻与多翻总数、匹配时间差之和，仍并列取匹配的踏板事件序号序列
+    字典序最小。返回每条提示的匹配或漏翻、未匹配事件的多翻标记及两项代价
+    （响应数值仍为 JSON number）。事件秒数须严格落在 [0, 演奏总时长) 内且
+    按时间非降序（精确比较：略早于终点可接受、略逆序即 422），页码越出
+    1..规划页数同样返回 422。
     """
     assert store is not None
     record = store.get(plan_id)
@@ -1280,7 +1281,7 @@ def audit_rehearsal_pedal_log(
     page_starts = [p.start_measure for p in plan_result.pages]
 
     try:
-        rehearsal = prepare_rehearsal(
+        result = audit_pedal_log(
             measure_count=len(plan_request.measure_heights),
             beats_per_measure=payload.beats_per_measure,
             tempo_bpm=payload.tempo_bpm,
@@ -1289,21 +1290,11 @@ def audit_rehearsal_pedal_log(
                 for r in payload.repeats
             ],
             page_starts=page_starts,
-        )
-        cues = rehearsal.turn_cues(
-            silences=plan_request.silence_seconds,
-            min_turn_time=plan_request.min_turn_time,
-        )
-        result = audit_pedal_log(
-            cue_seconds=[cue.boundary_seconds for cue in cues],
-            cue_to_pages=[cue.to_page for cue in cues],
-            cue_from_pages=[cue.from_page for cue in cues],
+            page_count=plan_result.page_count,
             events=[
                 PedalEvent(seconds=e.seconds, page_after=e.page_after)
                 for e in payload.pedal_events
             ],
-            total_duration=rehearsal.total_duration,
-            page_count=plan_result.page_count,
             tolerance_seconds=payload.tolerance_seconds,
         )
     except (RehearsalError, PedalAuditError) as exc:

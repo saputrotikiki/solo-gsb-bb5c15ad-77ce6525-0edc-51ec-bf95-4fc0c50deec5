@@ -317,3 +317,109 @@ def test_pedal_audit_global_alignment_one_to_one(client):
     body = resp.json()
     assert body["total_error_count"] == 0
     assert [c["pedal_event_index"] for c in body["cue_audits"]] == [0, 1, 2]
+
+
+def test_pedal_audit_exact_cue_time_zero_tolerance(client):
+    # 提示时刻由 0.1 + 0.2 拍精确重建为 0.3 秒（不经浮点累加）；
+    # 容差 0 时事件 0.3000000005 不得误匹配（无 epsilon 放行）
+    # 页 1 = 小节 0..1、页 2 = 小节 2（高度 1+1=2 满页，小节 2 独占一页）
+    resp = client.post(
+        "/api/v1/plans",
+        json={
+            "measure_heights": [1, 1, 2],
+            "silence_seconds": [0, 0, 0],
+            "page_height": 2,
+            "min_turn_time": 0,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    plan_id = resp.json()["id"]
+    payload = {
+        "beats_per_measure": [0.1, 0.2, 0.7],
+        "tempo_bpm": 60,
+        "repeats": [],
+        "tolerance_seconds": 0.0,
+    }
+    r = client.post(
+        f"/api/v1/plans/{plan_id}/rehearsal/pedal-audit",
+        json={
+            **payload,
+            "pedal_events": [{"seconds": 0.3000000005, "page_after": 2}],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["cue_audits"][0]["expected_seconds"] == pytest.approx(0.3)
+    assert body["cue_audits"][0]["matched"] is False
+    assert body["extra_turns"] == [0]
+    assert body["total_error_count"] == 2
+    # 恰好 0.3 才匹配，时间差精确为 0
+    r = client.post(
+        f"/api/v1/plans/{plan_id}/rehearsal/pedal-audit",
+        json={**payload, "pedal_events": [{"seconds": 0.3, "page_after": 2}]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["cue_audits"][0]["matched"] is True
+    assert body["cue_audits"][0]["time_diff_seconds"] == 0.0
+    assert body["total_error_count"] == 0
+
+
+def test_pedal_audit_equal_diff_tie_picks_earliest_event(client):
+    # 提示 0.4 秒；同目标页事件 0.3 与 0.5、容差 0.1：两侧时间差精确相等
+    # （均为 0.1），等成本取事件序号字典序最小 → 匹配 0.3 的事件，0.5 为多翻
+    resp = client.post(
+        "/api/v1/plans",
+        json={
+            "measure_heights": [1, 1],
+            "silence_seconds": [0, 0],
+            "page_height": 1,
+            "min_turn_time": 0,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    plan_id = resp.json()["id"]
+    r = client.post(
+        f"/api/v1/plans/{plan_id}/rehearsal/pedal-audit",
+        json={
+            "beats_per_measure": [0.4, 0.6],
+            "tempo_bpm": 60,
+            "repeats": [],
+            "pedal_events": [
+                {"seconds": 0.3, "page_after": 2},
+                {"seconds": 0.5, "page_after": 2},
+            ],
+            "tolerance_seconds": 0.1,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["cue_audits"][0]["matched"] is True
+    assert body["cue_audits"][0]["pedal_event_index"] == 0
+    assert body["cue_audits"][0]["time_diff_seconds"] == pytest.approx(0.1)
+    assert body["extra_turns"] == [1]
+    assert body["total_error_count"] == 1
+    assert body["total_time_diff_seconds"] == pytest.approx(0.1)
+
+
+def test_pedal_audit_event_slightly_before_end_accepted(client):
+    plan_id = _create_plan(client)
+    # 总时长 12 秒；事件 11.9999999999 略早于终点（差 1e-10）可接受
+    resp = _audit(client, plan_id, [{"seconds": 11.9999999999, "page_after": 2}])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["extra_turns"] == [0]
+
+
+def test_pedal_audit_event_slightly_out_of_order_rejected(client):
+    plan_id = _create_plan(client)
+    # 略逆序（1e-10）即拒绝：非降序按精确比较，无 epsilon 放行
+    resp = _audit(
+        client,
+        plan_id,
+        [
+            {"seconds": 4.0000000001, "page_after": 2},
+            {"seconds": 4.0, "page_after": 2},
+        ],
+    )
+    assert resp.status_code == 422
+    assert "非降序" in resp.text
