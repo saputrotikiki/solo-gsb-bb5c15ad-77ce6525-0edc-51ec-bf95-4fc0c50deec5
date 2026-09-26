@@ -10,7 +10,12 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .booklet import ImpositionError, impose_booklet
-from .pedal_audit import PedalAuditError, PedalEvent, audit_pedal_log
+from .pedal_audit import (
+    PedalAuditError,
+    PedalEvent,
+    audit_pedal_log,
+    build_exact_timeline,
+)
 from .planner import Plan, PlanningError, plan_pages
 from .practice_route import PracticeRouteError, plan_practice_route
 from .practice_tabs import PracticeTabError, plan_practice_tabs
@@ -1262,13 +1267,16 @@ def audit_rehearsal_pedal_log(
 ) -> RehearsalPedalAuditResponse:
     """为已保存方案校对排练踏板日志。
 
-    复用定位/提示接口的演奏顺序与时间轴，先用排练参数（每小节拍数、速度、
-    互不相交的重复段）生成含重复段回跳回翻的应翻页提示；再把按时间非降序
-    提交的踏板事件（秒数、操作后页码）与提示做全局一对一匹配——仅当目标页
-    相同且时间差不超过非负容差时允许匹配。依次最小化漏翻与多翻总数、匹配
-    时间差之和，仍并列取匹配的踏板事件序号序列字典序最小。返回每条提示的
-    匹配或漏翻、未匹配事件的多翻标记及两项代价。秒数越出演奏时长（含恰等
-    于总时长）或页码越出 1..规划页数的事件返回 422。
+    复用定位/提示接口的演奏顺序，先用排练参数（每小节拍数、速度、互不相交
+    的重复段）生成含重复段回跳回翻的应翻页提示；校对内部的提示时刻则从拍数
+    与速度的十进制字面量按重复段精确重建（有理数），事件秒数与容差同样精确
+    解析，匹配资格、非降序/[0,总时长) 判定与累计时间差均不使用浮点或
+    epsilon。再把按时间非降序提交的踏板事件（秒数、操作后页码）与提示做
+    全局一对一匹配——仅当目标页相同且时间差不超过非负容差时允许匹配。依次
+    最小化漏翻与多翻总数、匹配时间差之和，仍并列取匹配的踏板事件序号序列
+    字典序最小。返回每条提示的匹配或漏翻、未匹配事件的多翻标记及两项代价。
+    秒数越出演奏时长（含恰等于总时长；略早于终点可接受）、时间略逆序或
+    页码越出 1..规划页数的事件返回 422。
     """
     assert store is not None
     record = store.get(plan_id)
@@ -1294,15 +1302,30 @@ def audit_rehearsal_pedal_log(
             silences=plan_request.silence_seconds,
             min_turn_time=plan_request.min_turn_time,
         )
+        # 校对内部改用精确时间轴：从拍数/速度的十进制字面量按重复段重建每条
+        # 提示时刻与总时长（Fraction），避免 60×拍数/速度 的二进制浮点误差
+        # （如 4 拍/200 BPM 的 0.3 秒被算成 0.30000000000000004）影响匹配。
+        timeline = build_exact_timeline(
+            measure_count=len(plan_request.measure_heights),
+            beats_per_measure=payload.beats_per_measure,
+            tempo_bpm=payload.tempo_bpm,
+            repeats=[
+                (r.start_measure, r.end_measure, r.play_count)
+                for r in payload.repeats
+            ],
+            cue_targets=[
+                (cue.to_measure, cue.to_playthrough) for cue in cues
+            ],
+        )
         result = audit_pedal_log(
-            cue_seconds=[cue.boundary_seconds for cue in cues],
+            cue_seconds=timeline.cue_times,
             cue_to_pages=[cue.to_page for cue in cues],
             cue_from_pages=[cue.from_page for cue in cues],
             events=[
                 PedalEvent(seconds=e.seconds, page_after=e.page_after)
                 for e in payload.pedal_events
             ],
-            total_duration=rehearsal.total_duration,
+            total_duration=timeline.total_duration,
             page_count=plan_result.page_count,
             tolerance_seconds=payload.tolerance_seconds,
         )

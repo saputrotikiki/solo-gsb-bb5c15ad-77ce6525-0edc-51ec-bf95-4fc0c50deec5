@@ -263,6 +263,75 @@ def test_result_is_deterministic():
     assert r1.total_time_diff_seconds == r2.total_time_diff_seconds
 
 
+def test_exact_timeline_rebuilds_decimal_cue_times():
+    # 1 拍 / 200 BPM 的边界十进制下恰为 0.3 秒，浮点会算成 0.30000000000000004
+    from fractions import Fraction
+
+    from app.pedal_audit import build_exact_timeline
+
+    tl = build_exact_timeline(1, [1], 200, [], [])
+    assert tl.total_duration == Fraction(3, 10)
+    # 2 拍 / 300 BPM 恰为 0.4 秒
+    tl2 = build_exact_timeline(1, [2], 300, [], [])
+    assert tl2.total_duration == Fraction(2, 5)
+
+
+def test_tolerance_zero_no_float_slop():
+    # 精确提示 0.3 秒（由拍数/速度十进制字面量重建），事件 0.3000000005 秒，
+    # 容差 0：真实差 5e-10 秒，不得因二进制浮点误差误匹配
+    from fractions import Fraction
+
+    r = _audit(
+        [(Fraction(3, 10), 2)],
+        [(0.3000000005, 2)],
+        0.0,
+    )
+    assert r.total_error_count == 2
+    assert not r.cue_audits[0].matched
+    # 十进制字面上恰好 0.3 秒的事件必须能匹配
+    r2 = _audit([(Fraction(3, 10), 2)], [(0.3, 2)], 0.0)
+    assert r2.total_error_count == 0
+    assert r2.cue_audits[0].matched
+    assert r2.cue_audits[0].time_diff_seconds == 0.0
+
+
+def test_equidistant_events_exact_tie_picks_earlier_index():
+    # 精确提示 0.4 秒；同目标页事件 0.3 与 0.5 在十进制下等距（均差 0.1）。
+    # 浮点曾把提示算成略小于 0.4 而误取后一条；精确口径下时间差和并列，
+    # 第三级目标取事件序号字典序最小（事件 0）。
+    from fractions import Fraction
+
+    r = _audit(
+        [(Fraction(2, 5), 2)],
+        [(0.3, 2), (0.5, 2)],
+        0.5,
+    )
+    assert r.total_error_count == 1
+    assert _matched_indices(r) == (0,)
+    assert r.cue_audits[0].time_diff_seconds == pytest.approx(0.1)
+    assert r.extra_turns == [1]
+
+
+def test_just_before_total_duration_accepted():
+    # 略早于终点（0.9999999999 对总时长 1）属于 [0, 总时长)，必须接受
+    r = _audit([], [(0.9999999999, 1)], 0.0, duration=1.0)
+    assert r.extra_turns == [0]
+
+
+def test_slight_inversion_rejected():
+    # 非降序严格按十进制精确值判定：哪怕只早一点点也返回错误
+    with pytest.raises(PedalAuditError, match="非降序"):
+        audit_pedal_log(
+            cue_seconds=[],
+            cue_to_pages=[],
+            cue_from_pages=[],
+            events=_events([(1.0, 1), (0.9999999999, 1)]),
+            total_duration=10.0,
+            page_count=5,
+            tolerance_seconds=0.0,
+        )
+
+
 def test_backward_cue_target_page_drives_match():
     # 重复段回跳造成的回翻提示目标页较小（如 to_page=1）；
     # 只有操作后页码=1 的事件能匹配
@@ -284,14 +353,25 @@ def test_backward_cue_target_page_drives_match():
 
 
 def _brute_force(cues, events, tol):
-    """全元组后缀 DP：(漏翻+多翻, 时间差和, 匹配事件序号元组) 整体字典序。"""
+    """全元组后缀 DP：(漏翻+多翻, 时间差和, 匹配事件序号元组) 整体字典序。
+
+    与校对核心一致采用十进制字面量精确比较（Fraction），不使用浮点或 epsilon。
+    """
+    from fractions import Fraction
+
+    def _f(x):
+        return Fraction(str(x))
+
+    cues = [(_f(t), p) for t, p in cues]
+    events = [(_f(t), p) for t, p in events]
+    tol = _f(tol)
     m, n = len(cues), len(events)
     dp = [[None] * (n + 1) for _ in range(m + 1)]
-    dp[m][n] = (0, 0.0, ())
+    dp[m][n] = (0, Fraction(0), ())
     for i in range(m):
-        dp[i][n] = (m - i, 0.0, ())
+        dp[i][n] = (m - i, Fraction(0), ())
     for j in range(n + 1):
-        dp[m][j] = (n - j, 0.0, ())
+        dp[m][j] = (n - j, Fraction(0), ())
     for i in range(m - 1, -1, -1):
         for j in range(n - 1, -1, -1):
             candidates = [
@@ -300,11 +380,12 @@ def _brute_force(cues, events, tol):
             ]
             ct, cp = cues[i]
             et, ep = events[j]
-            if cp == ep and abs(ct - et) <= tol + 1e-9 * max(1.0, tol):
+            if cp == ep and abs(ct - et) <= tol:
                 g, s, t = dp[i + 1][j + 1]
                 candidates.append((g, s + abs(ct - et), (j,) + t))
             dp[i][j] = min(candidates, key=lambda x: (x[0], x[1], x[2]))
-    return dp[0][0]
+    g, s, t = dp[0][0]
+    return g, float(s), t
 
 
 @pytest.mark.parametrize("seed", range(300))

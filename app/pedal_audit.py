@@ -22,12 +22,33 @@
 3. 仍并列时，取**匹配到的踏板事件序号序列字典序最小**的对齐（序号序列按提示
    顺序排列，因单调对齐天然严格递增；先比第一个匹配的事件序号，再依次比后续）。
 
+精确时间轴
+==========
+
+提示时刻来自 ``60 × 拍数 / 速度`` 的前缀累计：像 4 拍/200 BPM 这样的边界恰为
+0.3 秒，但二进制浮点把它算成 0.30000000000000004，容差为 0 时会与日志里的
+0.3000000005 秒误匹配；0.4 秒边界则可能被算成略小于 0.4，导致 0.3 与 0.5 秒
+两个等距事件被判出不同距离、误取后者。因此校对内部所有时间一律按**有理数精确
+计算**：
+
+- 提示时刻由 :func:`build_exact_timeline` 从拍数与速度的**十进制字符串字面量**
+  构造（``Decimal(str(x))`` → ``Fraction``），再按重复段逐遍累加得到，与排练
+  接口 ``rehearsal.expand_repeats`` 的展开顺序完全一致；
+- 事件秒数与容差同样先按十进制字面量转为 ``Fraction``；
+- 匹配资格（``|Δt| ≤ 容差``）、事件时刻的非降序与 ``[0, 总时长)`` 边界、以及
+  DP 中累计的时间差之和全部是 ``Fraction`` 精确比较，**不使用浮点，也不使用
+  任何 epsilon 容差**——恰好等于容差允许匹配，事件恰在总时长视为越界，时刻
+  哪怕只早一点点（如 0.9999999999 对 1）也算逆序。
+
+对外响应中的秒数字段仍为 JSON number（float）；float 转换只发生在输出边界，
+不参与任何匹配或累计判定。
+
 算法
 ====
 
 设提示 m 条、日志事件 n 条（均 ≤ 500）。先做后缀标量 DP：``G[i][j]`` /
 ``S[i][j]`` 分别为把提示 ``[i:]`` 与事件 ``[j:]`` 对齐的最小（漏翻+多翻）数与
-该数下的最小时间差之和。三种转移：
+该数下的最小时间差之和（``S`` 以 ``Fraction`` 精确累计）。三种转移：
 
 - 漏翻提示 i：``(G[i+1][j]+1, S[i+1][j])``；
 - 多翻事件 j：``(G[i][j+1]+1, S[i][j+1])``；
@@ -47,11 +68,19 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+from decimal import Decimal
+from fractions import Fraction
 from functools import lru_cache
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
+from .rehearsal import expand_repeats
 
 # 对齐两侧（应翻提示数 / 踏板事件数）的共同上限，限制 O(m·n) 的 DP 规模
 MAX_EVENTS = 500
+
+# 校对内部统一使用的精确时间类型：所有匹配资格与累计比较都基于它
+ExactTime = Fraction
+Number = Union[int, float, Decimal, Fraction]
 
 
 class PedalAuditError(ValueError):
@@ -108,28 +137,118 @@ class PedalAuditResult:
     total_time_diff_seconds: float  # 匹配时间差之和（第二项代价，全局最小）
 
 
-def _time_eps(magnitude: float) -> float:
-    """演奏时间轴边界（总时长、非降序）比较用浮点容差，随数量级缩放。"""
-    return 1e-9 * max(1.0, abs(magnitude))
+@dataclass(frozen=True)
+class ExactTimeline:
+    """按排练参数精确重建的演奏时间轴。
+
+    :param total_duration: 按重复段展开后的演奏总时长（精确有理数）
+    :param cue_times: 每条应翻提示的精确边界时刻，顺序与 Web 层
+        ``Rehearsal.turn_cues`` 返回的提示一一对应
+    """
+
+    total_duration: ExactTime
+    cue_times: List[ExactTime]
 
 
-def _match_eps(tolerance: float, diff: float) -> float:
-    """单次匹配的容差边界比较用浮点容差，随容差与时间差的数量级缩放。"""
-    return 1e-9 * max(1.0, tolerance, diff)
+def _to_fraction(value: Number) -> Fraction:
+    """把输入数值按其**十进制字面量**转为精确分数。
+
+    ``float`` 经 ``str`` 转换，得到 JSON/字面量所写的短十进制值
+    （``str(0.3) == '0.3'``），而非二进制浮点的近似展开；``int``、
+    ``Decimal`` 与 ``Fraction`` 原样精确转换。布尔值不视为数字。
+    """
+    if isinstance(value, bool):
+        raise PedalAuditError(f"数值不能为布尔值（收到 {value!r}）")
+    if isinstance(value, Fraction):
+        return value
+    if isinstance(value, int):
+        return Fraction(value)
+    if isinstance(value, Decimal):
+        return Fraction(value)
+    return Fraction(Decimal(str(value)))
+
+
+def _is_finite_number(value: object) -> bool:
+    """输入是否为可接受的有限数值（int/float/Decimal/Fraction，排除布尔）。"""
+    if isinstance(value, bool) or not isinstance(
+        value, (int, float, Decimal, Fraction)
+    ):
+        return False
+    if isinstance(value, float) and (
+        value != value or value in (float("inf"), float("-inf"))
+    ):
+        return False
+    return True
+
+
+def build_exact_timeline(
+    measure_count: int,
+    beats_per_measure: Sequence[Number],
+    tempo_bpm: Number,
+    repeats: Sequence[Tuple[int, int, int]],
+    cue_targets: Sequence[Tuple[int, int]],
+) -> ExactTimeline:
+    """从拍数与速度的十进制字面量按重复段精确重建提示时刻与总时长。
+
+    展开顺序与 :func:`app.rehearsal.expand_repeats` 完全一致（每遍完整覆盖
+    起止间全部小节后再进入后续小节）；每小节时长为 ``60 × 拍数 / 速度``，
+    全程 ``Fraction`` 精确累加。``cue_targets`` 给出每条应翻提示的
+    ``(to_measure, to_playthrough)``（即提示后一小节在演奏序列中的身份），
+    函数按该身份返回每条提示对应的精确边界时刻——同一原谱小节在不同遍次中
+    的跨页提示由此分别取到各自的精确时刻。
+
+    :raises PedalAuditError: 排练参数不合法（由排练展开逻辑判定）或某条提示
+        的目标身份不在展开后的演奏序列中（理论上不应发生）
+    """
+    try:
+        played = expand_repeats(measure_count, repeats)
+    except Exception as exc:  # 排练参数非法：归一为校对错误供 Web 层返回 422
+        raise PedalAuditError(str(exc)) from exc
+
+    beats = [_to_fraction(b) for b in beats_per_measure]
+    seconds_per_beat = Fraction(60) / _to_fraction(tempo_bpm)
+
+    # 每个演奏发声的精确开始时刻；同时按 (原谱小节, 遍次) 建索引
+    start_times: List[ExactTime] = []
+    start_by_identity: Dict[Tuple[int, int], ExactTime] = {}
+    elapsed = Fraction(0)
+    for played_measure in played:
+        start_times.append(elapsed)
+        start_by_identity[(played_measure.measure, played_measure.playthrough)] = (
+            elapsed
+        )
+        elapsed += beats[played_measure.measure] * seconds_per_beat
+
+    cue_times: List[ExactTime] = []
+    for idx, target in enumerate(cue_targets):
+        when = start_by_identity.get(target)
+        if when is None:
+            raise PedalAuditError(
+                f"第 {idx + 1} 条应翻提示的目标小节（原谱小节 {target[0]}、"
+                f"第 {target[1]} 遍）不在按重复段展开后的演奏序列中"
+            )
+        cue_times.append(when)
+
+    return ExactTimeline(total_duration=elapsed, cue_times=cue_times)
 
 
 def audit_pedal_log(
-    cue_seconds: Sequence[float],
+    cue_seconds: Sequence[Number],
     cue_to_pages: Sequence[int],
     cue_from_pages: Sequence[int],
     events: Sequence[PedalEvent],
-    total_duration: float,
+    total_duration: Number,
     page_count: int,
-    tolerance_seconds: float,
+    tolerance_seconds: Number,
 ) -> PedalAuditResult:
     """把按时间排列的踏板日志与应翻页提示做全局对齐校对。
 
-    :param cue_seconds: 每条应翻提示的边界时刻（秒，按时间升序）
+    内部时间全部按十进制字面量精确比较（见模块说明）：提示时刻、事件秒数、
+    容差与总时长先转为 ``Fraction``，匹配资格、非降序与区间判定及时间差累计
+    不使用浮点或 epsilon；输出字段在结果边界转回 float。
+
+    :param cue_seconds: 每条应翻提示的边界时刻（秒，按时间升序）；可为 float
+        （按其十进制字面量解析）或已构造好的精确 ``Fraction``
     :param cue_to_pages: 每条提示的目标页（1 基）；与 ``cue_seconds`` 等长
     :param cue_from_pages: 每条提示的翻页前页（1 基）；与 ``cue_seconds`` 等长，
         仅用于结果回显，不参与匹配
@@ -157,45 +276,49 @@ def audit_pedal_log(
             f"应翻页提示数（{m}）超过上限 {MAX_EVENTS}，无法校对"
         )
 
-    if not isinstance(tolerance_seconds, (int, float)) or isinstance(
-        tolerance_seconds, bool
-    ):
-        raise PedalAuditError("时间容差必须是数值")
-    tol = float(tolerance_seconds)
-    if tol != tol or tol in (float("inf"), float("-inf")):
+    if not _is_finite_number(tolerance_seconds):
         raise PedalAuditError("时间容差必须是有限数值（不接受 NaN 或 Infinity）")
+    tol = _to_fraction(tolerance_seconds)
     if tol < 0:
-        raise PedalAuditError(f"时间容差不能为负数（实际 {tol:g} 秒）")
+        raise PedalAuditError(f"时间容差不能为负数（实际 {float(tol):g} 秒）")
 
-    if not isinstance(total_duration, (int, float)) or total_duration <= 0:
+    if not _is_finite_number(total_duration):
+        raise PedalAuditError("演奏总时长必须是有限正数")
+    total = _to_fraction(total_duration)
+    if total <= 0:
         raise PedalAuditError("演奏总时长必须为正数")
     if not isinstance(page_count, int) or isinstance(page_count, bool) or page_count < 1:
         raise PedalAuditError("规划页数必须为正整数")
 
+    exact_cue_seconds: List[ExactTime] = []
+    for idx, seconds in enumerate(cue_seconds):
+        if not _is_finite_number(seconds):
+            raise PedalAuditError(f"第 {idx + 1} 条应翻提示时刻必须是有限数值")
+        exact_cue_seconds.append(_to_fraction(seconds))
+
     checked: List[PedalEvent] = []
-    prev_seconds: Optional[float] = None
+    event_times: List[ExactTime] = []
+    prev_seconds: Optional[ExactTime] = None
     for idx, event in enumerate(events):
         if not isinstance(event, PedalEvent):
             raise PedalAuditError(f"第 {idx + 1} 个踏板事件格式不合法")
         seconds = event.seconds
         page = event.page_after
-        if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
-            raise PedalAuditError(f"第 {idx + 1} 个踏板事件秒数必须是数值")
-        seconds = float(seconds)
-        if seconds != seconds or seconds in (float("inf"), float("-inf")):
+        if not _is_finite_number(seconds):
             raise PedalAuditError(
                 f"第 {idx + 1} 个踏板事件秒数必须是有限数值"
                 "（不接受 NaN 或 Infinity）"
             )
-        if seconds < 0:
+        exact_seconds = _to_fraction(seconds)
+        if exact_seconds < 0:
             raise PedalAuditError(
-                f"第 {idx + 1} 个踏板事件：操作时刻 {seconds:g} 秒不能为负数"
-                "（以演奏开始为 0）"
+                f"第 {idx + 1} 个踏板事件：操作时刻 {float(exact_seconds):g} 秒"
+                "不能为负数（以演奏开始为 0）"
             )
-        if seconds >= total_duration - _time_eps(total_duration):
+        if exact_seconds >= total:
             raise PedalAuditError(
-                f"第 {idx + 1} 个踏板事件：操作时刻 {seconds:g} 秒越出演奏时长"
-                f" {float(total_duration):g} 秒（须在 [0, 总时长) 内，"
+                f"第 {idx + 1} 个踏板事件：操作时刻 {float(exact_seconds):g} 秒"
+                f"越出演奏时长 {float(total):g} 秒（须在 [0, 总时长) 内，"
                 "恰等于总时长视为演奏结束之后）"
             )
         if not isinstance(page, int) or isinstance(page, bool):
@@ -207,19 +330,22 @@ def audit_pedal_log(
                 f"第 {idx + 1} 个踏板事件：操作后页码 {page} 越出页码范围"
                 f" 1..{page_count}"
             )
-        if prev_seconds is not None and seconds + _time_eps(prev_seconds) < prev_seconds:
+        # 严格精确比较：时刻哪怕只早一点点也算逆序，相等允许
+        if prev_seconds is not None and exact_seconds < prev_seconds:
             raise PedalAuditError(
-                f"第 {idx + 1} 个踏板事件：操作时刻 {seconds:g} 秒早于上一条"
-                f" {prev_seconds:g} 秒，踏板事件必须按时间非降序排列"
+                f"第 {idx + 1} 个踏板事件：操作时刻 {float(exact_seconds):g} 秒"
+                f"早于上一条 {float(prev_seconds):g} 秒，踏板事件必须按时间"
+                "非降序排列"
             )
-        checked.append(PedalEvent(seconds, page))
-        prev_seconds = seconds
+        checked.append(event)
+        event_times.append(exact_seconds)
+        prev_seconds = exact_seconds
 
     if m == 0:
         # 整篇只有一页：没有任何应翻提示，所有踏板事件都是多翻
         return PedalAuditResult(
-            total_duration=float(total_duration),
-            tolerance_seconds=tol,
+            total_duration=float(total),
+            tolerance_seconds=float(tol),
             cue_audits=[],
             extra_turns=list(range(n)),
             missed_count=0,
@@ -229,50 +355,58 @@ def audit_pedal_log(
         )
 
     return _align(
-        cue_seconds=[float(t) for t in cue_seconds],
+        cue_seconds=exact_cue_seconds,
         cue_to_pages=list(cue_to_pages),
         cue_from_pages=list(cue_from_pages),
         events=checked,
-        total_duration=float(total_duration),
+        event_times=event_times,
+        total_duration=total,
         tol=tol,
     )
 
 
 def _align(
-    cue_seconds: List[float],
+    cue_seconds: List[ExactTime],
     cue_to_pages: List[int],
     cue_from_pages: List[int],
     events: List[PedalEvent],
-    total_duration: float,
-    tol: float,
+    event_times: List[ExactTime],
+    total_duration: ExactTime,
+    tol: ExactTime,
 ) -> PedalAuditResult:
     """后缀标量 DP + 记忆化字典序重构（两侧均已校验、非空提示）。"""
     m, n = len(cue_seconds), len(events)
 
     # compatible[i][j]：提示 i 与事件 j 目标页相同且时间差不超过容差；
-    # weight[i][j] 为匹配对的时间差绝对值。
+    # weight[i][j] 为匹配对的精确时间差绝对值。
     compatible: List[bytearray] = [bytearray(n) for _ in range(m)]
-    weight: List[List[float]] = [[0.0] * n for _ in range(m)]
+    weight: List[List[ExactTime]] = [
+        [Fraction(0) for _ in range(n)] for _ in range(m)
+    ]
     for i in range(m):
         ct, cp = cue_seconds[i], cue_to_pages[i]
         row_c, row_w = compatible[i], weight[i]
         for j in range(n):
             if events[j].page_after == cp:
-                diff = abs(events[j].seconds - ct)
-                if diff <= tol + _match_eps(tol, diff):
+                diff = abs(event_times[j] - ct)
+                # 精确比较：恰好等于容差允许匹配，超出哪怕一点也不行
+                if diff <= tol:
                     row_c[j] = 1
                     row_w[j] = diff
 
-    # 时间差之和一律用浮点的精确比较（< / ==）。每个 S 值都是由同一张 weight 表
-    # 逐次相加得到，重构时用与填充完全相同的表达式（S[后继] + weight[i][j]）复算，
-    # Python 浮点加法确定且可复现，故同一动作在填充与重构处必然逐位一致——既不会
-    # 把真实不同（哪怕仅差 1e-15）的两项代价误判为并列，也不会让重构漏掉最优动作。
-    def _same_cost(g: int, s: float, g_ref: int, s_ref: float) -> bool:
+    # 时间差之和一律用 Fraction 精确比较（< / ==）。每个 S 值都是由同一张
+    # weight 表逐次相加得到，重构时用与填充完全相同的表达式
+    # （S[后继] + weight[i][j]）复算，分数加法确定且可复现，故同一动作在
+    # 填充与重构处必然一致——既不会把真实并列的两项代价误判为不同，也不会
+    # 让重构漏掉最优动作。
+    def _same_cost(g: int, s: ExactTime, g_ref: int, s_ref: ExactTime) -> bool:
         return g == g_ref and s == s_ref
 
     # 后缀标量 DP：G = 最小（漏翻+多翻）数，S = 该数下的最小时间差之和。
     gaps = [[0] * (n + 1) for _ in range(m + 1)]
-    sums = [[0.0] * (n + 1) for _ in range(m + 1)]
+    sums: List[List[ExactTime]] = [
+        [Fraction(0) for _ in range(n + 1)] for _ in range(m + 1)
+    ]
     for i in range(m):
         gaps[i][n] = m - i  # 事件耗尽：剩余提示全部漏翻
     for j in range(n):
@@ -358,7 +492,7 @@ def _align(
             cue_audits.append(
                 CueAudit(
                     cue_index=i,
-                    expected_seconds=cue_seconds[i],
+                    expected_seconds=float(cue_seconds[i]),
                     to_page=cue_to_pages[i],
                     from_page=cue_from_pages[i],
                     matched=False,
@@ -371,29 +505,26 @@ def _align(
             cue_audits.append(
                 CueAudit(
                     cue_index=i,
-                    expected_seconds=cue_seconds[i],
+                    expected_seconds=float(cue_seconds[i]),
                     to_page=cue_to_pages[i],
                     from_page=cue_from_pages[i],
                     matched=True,
                     pedal_event_index=j,
-                    pedal_seconds=events[j].seconds,
-                    time_diff_seconds=weight[i][j],
+                    pedal_seconds=float(event_times[j]),
+                    time_diff_seconds=float(weight[i][j]),
                 )
             )
 
     extra_turns = [j for j in range(n) if j not in used_events]
-    total_diff = sums[0][0]
-    if total_diff == 0:
-        total_diff = 0.0
     return PedalAuditResult(
-        total_duration=total_duration,
-        tolerance_seconds=tol,
+        total_duration=float(total_duration),
+        tolerance_seconds=float(tol),
         cue_audits=cue_audits,
         extra_turns=extra_turns,
         missed_count=missed_count,
         extra_count=len(extra_turns),
         total_error_count=gaps[0][0],
-        total_time_diff_seconds=total_diff,
+        total_time_diff_seconds=float(sums[0][0]),
     )
 
 

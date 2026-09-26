@@ -299,6 +299,119 @@ def test_pedal_audit_does_not_modify_saved_plan(client):
     assert before == after
 
 
+def _exact_decimal_plan(client):
+    """两页各含一个 1 拍小节：用于构造 0.3/0.4 秒等十进制精确边界。"""
+    resp = client.post(
+        "/api/v1/plans",
+        json={
+            "measure_heights": [1, 1],
+            "silence_seconds": [1, 0],
+            "page_height": 1,
+            "min_turn_time": 0,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+def test_pedal_audit_tolerance_zero_no_float_slop(client):
+    # 1 拍/200 BPM：唯一跨页提示精确发生在 0.3 秒（浮点为 0.30000000000000004）。
+    # 事件 0.3000000005 与容差 0 时不得因浮点误差误匹配。
+    plan_id = _exact_decimal_plan(client)
+    payload = {
+        "beats_per_measure": [1, 1],
+        "tempo_bpm": 200,
+        "repeats": [],
+        "pedal_events": [{"seconds": 0.3000000005, "page_after": 2}],
+        "tolerance_seconds": 0.0,
+    }
+    resp = client.post(
+        f"/api/v1/plans/{plan_id}/rehearsal/pedal-audit", json=payload
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert len(body["cue_audits"]) == 1
+    cue = body["cue_audits"][0]
+    assert cue["matched"] is False
+    assert cue["pedal_event_index"] is None
+    assert body["missed_count"] == 1
+    assert body["extra_turns"] == [0]
+
+    # 十进制字面量恰好 0.3 秒的事件在容差 0 下必须匹配
+    payload["pedal_events"] = [{"seconds": 0.3, "page_after": 2}]
+    resp = client.post(
+        f"/api/v1/plans/{plan_id}/rehearsal/pedal-audit", json=payload
+    )
+    assert resp.status_code == 200, resp.text
+    cue = resp.json()["cue_audits"][0]
+    assert cue["matched"] is True
+    assert cue["pedal_event_index"] == 0
+    assert cue["time_diff_seconds"] == 0.0
+
+
+def test_pedal_audit_equidistant_events_picks_earlier(client):
+    # 2 拍/300 BPM：唯一跨页提示精确发生在 0.4 秒。同目标页事件 0.3 与 0.5
+    # 在十进制下等距（均差 0.1 秒）；浮点曾把提示算成略小于 0.4 而误取后一条，
+    # 精确口径下时间差和并列，第三级目标取事件序号字典序最小（事件 0）。
+    plan_id = _exact_decimal_plan(client)
+    resp = client.post(
+        f"/api/v1/plans/{plan_id}/rehearsal/pedal-audit",
+        json={
+            "beats_per_measure": [2, 2],
+            "tempo_bpm": 300,
+            "repeats": [],
+            "pedal_events": [
+                {"seconds": 0.3, "page_after": 2},
+                {"seconds": 0.5, "page_after": 2},
+            ],
+            "tolerance_seconds": 0.5,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    cue = body["cue_audits"][0]
+    assert cue["matched"] is True
+    assert cue["pedal_event_index"] == 0
+    assert cue["time_diff_seconds"] == pytest.approx(0.1)
+    assert body["extra_turns"] == [1]
+
+
+def test_pedal_audit_just_before_total_duration_accepted(client):
+    # 2 拍/300 BPM 总时长 0.8 秒；略早于终点的 0.7999999999 秒必须接受
+    plan_id = _exact_decimal_plan(client)
+    resp = client.post(
+        f"/api/v1/plans/{plan_id}/rehearsal/pedal-audit",
+        json={
+            "beats_per_measure": [2, 2],
+            "tempo_bpm": 300,
+            "repeats": [],
+            "pedal_events": [{"seconds": 0.7999999999, "page_after": 2}],
+            "tolerance_seconds": 0.0,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_pedal_audit_slight_inversion_rejected(client):
+    # 非降序严格按十进制精确值判定：后一条哪怕只早一点点也返回 422
+    plan_id = _exact_decimal_plan(client)
+    resp = client.post(
+        f"/api/v1/plans/{plan_id}/rehearsal/pedal-audit",
+        json={
+            "beats_per_measure": [2, 2],
+            "tempo_bpm": 300,
+            "repeats": [],
+            "pedal_events": [
+                {"seconds": 0.5, "page_after": 2},
+                {"seconds": 0.4999999999, "page_after": 2},
+            ],
+            "tolerance_seconds": 0.0,
+        },
+    )
+    assert resp.status_code == 422
+    assert "非降序" in resp.text
+
+
 def test_pedal_audit_global_alignment_one_to_one(client):
     plan_id = _create_plan(client)
     # 提示 4→2、6→1、8→2；容差 2 秒，多条事件可能同时在两条提示容差内，
